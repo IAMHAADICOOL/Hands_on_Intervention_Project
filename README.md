@@ -1,6 +1,8 @@
 # Hands-on Intervention (HOI) Project
 
-A ROS 2 simulation project implementing Task-Priority kinematic control for a **vehicle-manipulator system** consisting of a **Kobuki TurtleBot 2** differential-drive base and a **uArm Swift Pro** 4-DOF manipulator arm, simulated in [Stonefish](https://stonefish.readthedocs.io).
+A ROS 2 simulation project implementing Task-Priority kinematic control for a **vehicle-manipulator system (VMS)** consisting of a **Kobuki TurtleBot 2** differential-drive base and a **uArm Swift Pro** 4-DOF manipulator arm, simulated in [Stonefish](https://stonefish.readthedocs.io).
+
+The primary demonstration is an autonomous **pick-and-place** task: the robot searches for an ArUco-tagged box, navigates to it, picks it up with the suction-cup end-effector, carries it to a drop-off point, and releases it — all using Task-Priority resolved-rate control over the full 6-DOF VMS.
 
 **Team:** Haadi / Huy / Phu
 
@@ -8,21 +10,37 @@ A ROS 2 simulation project implementing Task-Priority kinematic control for a **
 
 ## System Overview
 
-The physical system is a mobile manipulator with 6 controllable degrees of freedom:
-
 ```
-ζ = [vx, ω, dq1, dq2, dq3, dq4]
-     ────  ─────────────────────
-     base        arm
+ζ = [vx, ω,  dq1, dq2, dq3, dq4]
+     ──────  ──────────────────────
+      base          arm
 ```
 
 | Component | Model | DOF |
 |-----------|-------|-----|
-| Mobile base | Kobuki TurtleBot 2 (differential drive) | 2 (linear velocity `v`, angular velocity `ω`) |
+| Mobile base | Kobuki TurtleBot 2 (differential drive) | 2 (`v` linear, `ω` angular) |
 | Arm | uArm Swift Pro (parallelogram linkage) | 4 (`q1` base yaw, `q2` shoulder, `q3` elbow, `q4` EE yaw) |
-| **Total** | VMS (Vehicle-Manipulator System) | **6** |
+| **Total VMS** | | **6** |
 
-> **No Denavit-Hartenberg:** the uArm's parallelogram closed-chain linkage makes DH convention invalid. All kinematics are derived geometrically. The parallelogram constraint enforces `q4 = -(q2 + q3)`, keeping the wrist permanently horizontal and reducing independent position DOF to 3 on the arm alone.
+> **No Denavit-Hartenberg:** the uArm's closed-chain parallelogram linkage makes DH convention invalid. All kinematics are derived geometrically. The parallelogram constraint enforces `q4 = -(q2 + q3)`, keeping the wrist permanently horizontal and reducing independent position DOF to 3 on the arm.
+
+---
+
+## Running
+
+Two terminals are required: one for the simulation, one for the control node.
+
+**Terminal 1 — Simulation**
+```bash
+source install/setup.bash
+ros2 launch turtlebot_simulation_1 turtlebot_hoi.launch.py
+```
+
+**Terminal 2 — Pick-and-place controller**
+```bash
+source install/setup.bash
+ros2 run hoi_control lab2_pick_place_vms_node.py
+```
 
 ---
 
@@ -30,7 +48,7 @@ The physical system is a mobile manipulator with 6 controllable degrees of freed
 
 ```
 src/
-├── hoi_control/              ← Main control package (see below)
+├── hoi_control/              ← Main control package
 ├── kobuki_description/       ← URDF + meshes for the Kobuki base
 ├── swiftpro_description/     ← URDF + meshes for the uArm Swift Pro
 ├── turtlebot_description/    ← URDF for the combined TurtleBot robot
@@ -45,101 +63,104 @@ src/
 
 ## `hoi_control` — Main Package
 
-The core of the project. Contains all kinematics, task definitions, and ROS 2 control nodes.
-
 ### Kinematics Libraries
 
-#### `swiftpro_robotics.py` — Arm-only kinematics
+#### `swiftpro_robotics.py` — Arm-only (3-DOF)
 
-| Symbol | Description |
-|--------|-------------|
-| `swiftpro_fk(q)` | Geometric forward kinematics → EE position in arm-local ENU |
-| `swiftpro_jacobian(q)` | 3×3 geometric Jacobian `[dq1, dq2, dq3] → [dx, dy, dz]` |
-| `swiftpro_ik(p)` | Analytical closed-form inverse kinematics |
+| Function / Class | Description |
+|-----------------|-------------|
+| `swiftpro_fk(q)` | Geometric FK → EE position in arm-local ENU |
+| `swiftpro_jacobian(q)` | 3×3 geometric Jacobian `[dq1,dq2,dq3] → [dx,dy,dz]` |
+| `swiftpro_ik(p)` | Closed-form analytical IK |
 | `SwiftProManipulator` | 3-DOF state container with FK / Jacobian queries |
-| `MobileManipulator` | 5-DOF model combining the differential-drive base + arm |
+| `MobileManipulator` | 5-DOF model (differential-drive base + 3-DOF arm) |
+| `ned_to_enu` / `enu_to_ned` | Frame conversion helpers |
+| `DLS` / `weighted_DLS` | Damped Least-Squares pseudo-inverse |
 
-#### `swiftpro_robotics_rrc.py` — VMS kinematics (RRC variant)
+#### `swiftpro_robotics_rrc.py` — VMS kinematics (6-DOF)
 
-| Symbol | Description |
-|--------|-------------|
-| `swiftpro_fk_with_tf_transform` | FK with live NED→ENU frame conversion via TF |
-| `swiftpro_jacobian_vms_5dof` | 3×5 VMS Jacobian `[vx, ω, dq1, dq2, dq3] → [dx, dy, dz]` |
+| Function / Class | Description |
+|-----------------|-------------|
+| `swiftpro_fk_with_tf_transform` | FK with live NED→ENU conversion via TF buffer |
+| `swiftpro_fk_vms_5dof` | 5-DOF VMS FK: base (x,y,ψ) + arm (q1,q2,q3) → world EE position |
+| `swiftpro_jacobian_vms_5dof` | 3×5 VMS Jacobian `[vx,ω,dq1,dq2,dq3] → [dx,dy,dz]` |
 | `swiftpro_jacobian_vms_6dof` | 4×6 VMS Jacobian including EE yaw row |
 | `SwiftProManipulator4DOF` | 4-DOF state container (adds `q4` EE yaw) |
 | `VMSRobotState` | Full 6-DOF VMS state container for task-priority control |
+| `DLS` / `weighted_DLS` / `scale_velocities` | Solver utilities |
 
 #### Coordinate Frames
 
-The project uses two frames throughout:
+| Frame | Convention | Used for |
+|-------|-----------|---------|
+| NED (North-East-Down) | Z points down | Stonefish simulator native |
+| ENU (East-North-Up) | Z points up | ROS nav topics, RViz, control loop |
 
-- **NED** (North-East-Down) — native Stonefish simulator frame, `z` points down
-- **ENU** (East-North-Up) — ROS navigation and RViz frame, `z` points up
-
-Helper functions `ned_to_enu` / `enu_to_ned` handle all conversions. TF is used to look up live transforms between `world_ned` and `world_enu`.
-
-### Task Classes
-
-Both kinematics libraries define a hierarchy of task types that plug directly into the Task-Priority solver:
-
-| Task | Dimension | Description |
-|------|-----------|-------------|
-| `Position3D` | 3×N | 3-D EE position error |
-| `Position2D_XY` | 2×N | Horizontal XY position only |
-| `HeightTask` | 1×N | EE height (Z) control |
-| `YawTask` | 1×N | EE yaw angle (`q1`) |
-| `Configuration3D` | 4×N | Combined position + yaw |
-| `JointPosition` | 1×N | Drive a single joint to a target angle |
-| `JointLimits` | 1×N | Inequality task — keep joint within safe limits |
-| `Obstacle3D` | 1×N | Inequality task — 3-D spherical obstacle avoidance |
-| `VMSPositionTask` | 3×6 | Position task in 6-DOF VMS quasi-velocity space |
-| `VMSYawTask` | 1×6 | EE yaw task in VMS |
-| `VMSConfigurationTask` | 4×6 | Position + yaw in VMS |
-| `VMSJointLimitsTask` | 1×6 | Joint limit avoidance in VMS |
-| `VMSObstacleTask` | 1×6 | Spherical obstacle avoidance in VMS (cylindrical option) |
-| `VMSBaseOrientationTask` | 1×6 | Drive base heading to a desired angle |
-| `VMSJointCenteringTask` | 4×6 | Null-space joint re-centering between goals |
+The TF tree exposes both `world_ned` and `world_enu` frames. The RRC kinematics functions look up the live NED→ENU rotation via the TF buffer with a manual fallback (180° rotation around X).
 
 ### Task-Priority Solver
 
 ```python
-# Arm-only (3 or 4 DOF)
-zeta = task_priority_step(tasks, robot, damping=0.1)
-
-# VMS (6 DOF)
+# VMS (6 DOF) — used by the main node
 zeta = vms_task_priority_step(tasks, state, damping=0.1, method=2)
-# method: 0=Jacobian transpose, 1=Moore-Penrose pinv, 2=DLS (default)
+# method: 0 = Jacobian transpose, 1 = Moore-Penrose pinv, 2 = DLS (default)
 ```
 
-The solver iterates from highest to lowest priority. Each task executes in the **null-space** of all higher-priority tasks, so higher-priority tasks are never disturbed. Inactive inequality tasks (joint limits, obstacles) are skipped automatically.
+Each task executes in the **null-space** of all higher-priority tasks. Inactive inequality tasks (joint limits) are skipped automatically. DLS is used instead of the plain pseudo-inverse to remain numerically stable near singular arm configurations.
 
-**Numerical stability:** Damped Least-Squares (DLS) is used instead of the plain pseudo-inverse to remain well-conditioned near singular arm configurations.
+### Task Classes (VMS)
 
-### Lab Nodes
+| Task | Jacobian | Description |
+|------|----------|-------------|
+| `VMSPositionTask` | 3×6 | 3-D EE position in world_enu |
+| `VMSYawTask` | 1×6 | EE yaw `ψ + q1 + q4` |
+| `VMSConfigurationTask` | 4×6 | Combined position + yaw |
+| `VMSJointLimitsTask` | 1×6 | Inequality — keep one joint within URDF limits |
+| `VMSJointPositionTask` | 1×6 | Drive one arm joint to a target angle |
+| `VMSBaseOrientationTask` | 1×6 | Drive base heading ψ to a desired angle |
+| `VMSJointCenteringTask` | 4×6 | Null-space re-centering of all arm joints |
+| `VMSObstacleTask` | 1×6 | Spherical (or cylindrical) obstacle avoidance |
+| `VMSYawQ4Task` | 1×6 | EE yaw via `q4` only (no base/arm coupling) |
+| `VMSQ4ZeroTask` | 1×6 | Return `q4` to neutral after a yaw manoeuvre |
 
-Each node is a self-contained ROS 2 node demonstrating one control concept, progressively building complexity:
+### Control Nodes
 
-| Node | Algorithm | Robot model |
-|------|-----------|-------------|
-| `lab2_kinematics_node.py` | Forward kinematics, constant joint velocities | Arm only (3 DOF) |
-| `lab2_rrc_node.py` | Resolved-Rate Control — EE tracks a 3-D target | Arm only (3 DOF) |
-| `lab2_rrc_methods_vms_node.py` | RRC with VMS, multiple inverse methods | VMS (6 DOF) |
-| `lab2_pick_place_vms_node.py` | Autonomous pick-and-place via ArUco detection + FSM | VMS (6 DOF) |
-| `lab3_null_space_node.py` | Null-space motion — joints move, EE stays fixed | Arm only |
-| `lab3_two_tasks_node.py` | Two-task priority (switchable case a/b) | Arm only |
-| `lab4_tp_node.py` | Full recursive Task-Priority, 4 configurable hierarchies | Arm only |
-| `lab5_joint_limits_node.py` | Joint limit avoidance (inequality tasks) | Arm only |
-| `lab5_obstacle_node.py` | 3-D spherical obstacle avoidance | Arm only |
-| `lab6_mobile_manip_node.py` | Full 5-DOF mobile manipulator Task-Priority | MobileManipulator |
+| Node | Purpose |
+|------|---------|
+| `lab2_pick_place_vms_node.py` | **Main node.** Autonomous ArUco pick-and-place via VMS Task-Priority + FSM |
+| `lab2_rrc_methods_vms_node.py` | VMS resolved-rate control to a fixed target; tunable via ROS params |
+| `lab2_rrc_node.py` | Arm-only resolved-rate control |
+| `lab2_rrc_debug_node.py` | RRC debug node — TF-based error, RViz markers, runtime param tuning |
+| `lab2_rrc_methods_debug_node.py` | 4-DOF RRC debug with runtime param tuning and auto goal cycling |
 
 #### Pick-and-Place FSM (`lab2_pick_place_vms_node.py`)
 
-The most complete node. Implements a finite-state machine for autonomous box retrieval using a camera-detected ArUco marker:
-
 ```
-SEARCH → ALIGN_DIST → ALIGN_ANGLE → APPROACH_BOX_VMS → PICK_DESCEND
-→ SUCTION_ON → PICK_ASCEND → NAVIGATE_TO_GOAL → PLACE_VMS_APPROACH
-→ PLACE_DESCEND → SUCTION_OFF → PLACE_ASCEND → DONE
+SEARCH               rotate base, scan for ArUco marker
+  ↓
+ALIGN_DIST           drive base to stand-off point in front of marker
+  ↓
+ALIGN_ANGLE          rotate in place until face-on to marker
+  ↓
+APPROACH_BOX_VMS     VMS: drive EE to approach height above box
+  ↓
+PICK_DESCEND         arm-only: lower EE to box top (suction contact)
+  ↓
+SUCTION_ON           activate suction cup, wait for settle
+  ↓
+PICK_ASCEND          arm-only: lift EE back to approach height
+  ↓
+NAVIGATE_TO_GOAL     VMS: drive robot to drop-off location carrying box
+  ↓
+PLACE_VMS_APPROACH   VMS: drive EE to approach height above drop point
+  ↓
+PLACE_DESCEND        arm-only: lower box to floor
+  ↓
+SUCTION_OFF          deactivate suction, release box
+  ↓
+PLACE_ASCEND         arm-only: lift EE away from floor
+  ↓
+DONE
 ```
 
 ### ROS Topics
@@ -147,30 +168,19 @@ SEARCH → ALIGN_DIST → ALIGN_ANGLE → APPROACH_BOX_VMS → PICK_DESCEND
 | Topic | Type | Direction | Description |
 |-------|------|-----------|-------------|
 | `/turtlebot/joint_states` | `sensor_msgs/JointState` | Subscribe | Arm joint positions from simulator |
-| `/turtlebot/swiftpro/joint_velocity_controller/command` | `std_msgs/Float64MultiArray` | Publish | Arm joint velocity commands `[dq1, dq2, dq3, dq4]` |
+| `/turtlebot/swiftpro/joint_velocity_controller/command` | `std_msgs/Float64MultiArray` | Publish | Arm velocity commands `[dq1,dq2,dq3,dq4]` |
 | `/turtlebot/cmd_vel` | `geometry_msgs/Twist` | Publish | Base linear / angular velocity |
-| `/turtlebot/odom` | `nav_msgs/Odometry` | Subscribe | Base odometry (mobile manipulator nodes) |
-| `/hoi/ee_position` | `geometry_msgs/PointStamped` | Publish | Current EE position |
-| `/hoi/markers` | `visualization_msgs/MarkerArray` | Publish | RViz target/error visualisation |
-
-### Launch
-
-A single launch file starts both the Stonefish simulation and one selected control node:
-
-```bash
-# Syntax
-ros2 launch hoi_control hoi_control.launch.py node:=<node_name> [hierarchy:=<a|b|c|d>] [case:=<a|b>]
-
-# Examples
-ros2 launch hoi_control hoi_control.launch.py node:=lab2_rrc
-ros2 launch hoi_control hoi_control.launch.py node:=lab4_tp hierarchy:=c
-ros2 launch hoi_control hoi_control.launch.py node:=lab3_two_tasks case:=a
-ros2 launch hoi_control hoi_control.launch.py node:=lab6_mobile_manip
-```
-
-Available `node` values: `lab2_kinematics`, `lab2_rrc`, `lab3_two_tasks`, `lab3_null_space`, `lab4_tp`, `lab5_joint_limits`, `lab5_obstacle`, `lab6_mobile_manip`.
+| `/hoi/rrc_methods_vms_markers` | `visualization_msgs/MarkerArray` | Publish | RViz target/error visualisation |
 
 ---
+
+## Building
+
+```bash
+cd <workspace_root>
+colcon build --packages-select hoi_control
+source install/setup.bash
+```
 
 ## Dependencies
 
@@ -180,15 +190,5 @@ Available `node` values: `lab2_kinematics`, `lab2_rrc`, `lab3_two_tasks`, `lab3_
 | [Stonefish](https://github.com/patrykcieslak/stonefish) + `stonefish_ros2` | Physics simulation |
 | `tf2_ros`, `tf2_geometry_msgs` | Frame transforms (NED ↔ ENU) |
 | `rclpy`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `visualization_msgs` | ROS 2 standard libraries |
-| NumPy | All linear algebra |
+| NumPy | Linear algebra |
 | OpenCV + `cv_bridge` | ArUco marker detection (pick-and-place node) |
-
----
-
-## Building
-
-```bash
-cd <workspace>
-colcon build --packages-select hoi_control
-source install/setup.bash
-```

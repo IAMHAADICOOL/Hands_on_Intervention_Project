@@ -1,0 +1,25 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+
+# ── Colcon build artifacts ────────────────────────────────────────────────────
+# Matches build/, install/, log/ wherever they appear in the tree
+# (colcon dirs should live at workspace root, never inside src/)
+**/build/
+**/install/
+**/log/
+
+# ── Runtime logs written by hoi_control nodes ─────────────────────────────────
+src/hoi_control/logs/
+
+# ── Scratch / notes files ─────────────────────────────────────────────────────
+src/hoi_control/hoi_control/test.txt
+src/hoi_control/hoi_control/explanation_to_some_complex_ideas.txt
+
+# ── OS / editor artefacts ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
