@@ -33,17 +33,16 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
-from sensor_msgs.msg import JointState, Image, CameraInfo
+from sensor_msgs.msg import JointState, Image
 from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import SetBool
-from control_msgs.msg import DynamicJointState, DynamicInterfaceGroupValues, InterfaceValue
 from geometry_msgs.msg import Twist, PointStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge
 from tf2_ros import (Buffer, TransformListener,
                      LookupException, ConnectivityException, ExtrapolationException)
 
-from hoi_control.swiftpro_robotics_rrc import (
+from hoi_control.swiftpro_robotics_rrc_2 import (
     swiftpro_fk_vms_5dof,
     DLS,
     weighted_DLS,
@@ -59,37 +58,21 @@ from hoi_control.swiftpro_robotics_rrc import (
     vms_task_priority_step,
 )
 
-# Topics / Frames
-# Set USE_DYNAMIC_JOINT_STATES = True  for real robot (ros2_control)
-#                               False for simulation (Stonefish JointState)
-# Set True for real robot, False for simulation
-USE_DYNAMIC_JOINT_STATES  = True
-USE_REAL_PUMP             = True   # True  → publish to PUMP_CMD_TOPIC (real robot)
-                                   # False → call SUCTION_SRV service   (simulation)
-USE_TF_FOR_EE             = True  # False → EE always from FK  (swiftpro_fk_vms_5dof, no TF lookup)
-                                   # True  → try TF lookup of end_effector frame first; FK as fallback
-                                   # On the real robot, the end_effector TF chain is noisy —
-                                   # leave False and let FK (which coincides with TF) drive EE position.
-
-JOINT_STATE_TOPIC         = '/turtlebot/joint_states'
-DYNAMIC_JOINT_STATE_TOPIC = '/turtlebot/dynamic_joint_states'
-JOINT_CMD_TOPIC           = '/turtlebot/joint_velocity_controller/commands'
-BASE_CMD_TOPIC            = '/turtlebot/cmd_vel'
-CAMERA_TOPIC              = '/turtlebot/camera/color/image_raw'
-CAMERA_INFO_TOPIC         = '/turtlebot/camera/color/camera_info'
-SUCTION_SRV               = '/turtlebot/swiftpro/vacuum_gripper/set_pump'
-PUMP_CMD_TOPIC            = '/turtlebot/gpio_controller/commands'
-MARKER_TOPIC              = '/hoi/pick_place_markers'
+# Topics / Frames 
+JOINT_STATE_TOPIC = '/turtlebot/joint_states'
+JOINT_CMD_TOPIC   = '/turtlebot/swiftpro/joint_velocity_controller/command'
+BASE_CMD_TOPIC    = '/turtlebot/cmd_vel'
+CAMERA_TOPIC      = '/turtlebot/camera/color/image_color'
+SUCTION_SRV       = '/turtlebot/swiftpro/vacuum_gripper/set_pump'
+MARKER_TOPIC      = '/hoi/pick_place_markers'
 
 WORLD_FRAME   = 'world_enu'
 EE_FRAME      = 'end_effector'
-J1_FRAME      = 'swiftpro/manipulator_base_link'
-# J1_FRAME      = 'turtlebot/swiftpro/manipulator_base_link'
-# BASE_FRAME    = 'turtlebot/base_footprint'
-BASE_FRAME    = 'base_footprint'
+J1_FRAME      = 'turtlebot/swiftpro/manipulator_base_link'
+BASE_FRAME    = 'turtlebot/base_footprint'
 CAMERA_FRAME  = 'camera_color_optical_frame'
 
-CONTROL_HZ = 30.0
+CONTROL_HZ = 60.0
 DT = 1.0 / CONTROL_HZ
 
 # RViz marker IDs 
@@ -140,19 +123,19 @@ PICK_ASCEND_Z_EXTRA = 0.00     # m (tune: 0 = same as approach, positive = highe
 
 # How close the EE needs to be to the box top for suction contact
 # (positive = EE slightly above, negative = pressed in)
-EE_TOUCH_Z_OFFSET = 0.005      # m above box top surface
+EE_TOUCH_Z_OFFSET = -0.003      # m above box top surface
 
 # Forward offset applied along the robot's heading direction (not world-X).
 # Positive = shift pick point further from the robot (away from base),
 # Negative = shift pick point closer to the robot.
 # Components are automatically decomposed: delta_x = offset·cos((sigh)), delta_y = offset·sin((sigh)).
-EE_TOUCH_FORWARD_OFFSET = 0.06   # m along robot heading (tune: range -0.05 – +0.05)
+EE_TOUCH_FORWARD_OFFSET = 0.0   # m along robot heading (tune: range -0.05 – +0.05)
 # Suction settle time (seconds) after toggling the pump
 SUCTION_SETTLE_S = 1.2
 
 # Navigation goal (world_enu coordinates the BASE should reach)
-GOAL_BASE_X  = -0.3     # m  (East)
-GOAL_BASE_Y  = 0.0     # m  (North, i.e. 1.8 m forward from start)
+GOAL_BASE_X  = 0.0     # m  (East)
+GOAL_BASE_Y  = 1.8     # m  (North, i.e. 1.8 m forward from start)
 GOAL_TOL_XY  = 0.15    # m  base position tolerance to declare "at goal"
 NAV_EE_Z     = 0.30    # m  EE height during VMS navigation
 
@@ -179,8 +162,7 @@ VMS_DAMPING      = 0.08   # DLS damping λ
 BASE_MAX_LINEAR  = 0.15   # m/s base linear speed cap
 BASE_MAX_ANGULAR = 0.45   # rad/s base yaw-rate cap
 
-VMS_PATH_PERIOD          = 30.0   # s  path period for VMS states (navigation, place)
-APPROACH_VMS_PATH_PERIOD = 60.0   # s  APPROACH_BOX_VMS runs for this long then locks
+VMS_PATH_PERIOD = 30.0   # s  path period for VMS states (approach, navigation)
 # PLACE_APPROACH_PATH_PERIOD = 20.0   # s  (Bézier arc — unused)
 # VMS_CURVE_HEIGHT     = 0.0    # m  (Bézier apex lift — unused)
 # VMS_CURVE_LATERAL    = -0.40  # m  (Bézier sideways pull — unused)
@@ -195,7 +177,7 @@ W_BASE_COST = 10.0   # cost on vx and ω (indices 0, 1 in quasi-velocity space)
 W_ARM_COST  = 1.0    # cost on dq1–dq4 (indices 2–5)
 
 # Goal-reached tolerance for arm states (EE position error in metres)
-EE_REACH_TOL = 0.009   # m
+EE_REACH_TOL = 0.005   # m
 # EE_REACH_TOL = 0.005   # m
 # XY alignment threshold for PICK_DESCEND swing phase:
 # once the EE is within this horizontal distance of the box centre, descend.
@@ -210,20 +192,9 @@ LIMIT_HYSTERESIS_RATIO = 1.5    # delta = margin x ratio; must be > 1 to avoid c
 # Roughly equal to the arm's max forward reach (~0.20 m).
 # APPROACH_STANDOFF  = 0.20   # m behind box (in robot heading direction)
 
-# Marker freshness — detections older than this are treated as "no marker visible".
-# Prevents the controller from correcting on stale data between slow camera frames.
-# Tune: set to ~2× the expected camera period (e.g. 0.5 s for a 5 Hz feed).
-MARKER_FRESHNESS_S = 0.5   # seconds
-
-# ALIGN_ANGLE incremental rotation per camera frame.
-# Far from centre: rotates ALIGN_STEP_DEG then waits for next frame.
-# Close to centre: np.clip naturally reduces step to the exact error,
-# so no separate fine-threshold is needed — overshoot is impossible.
-ALIGN_STEP_DEG = 8.0   # degrees
-
-# Search sweep
+# Search sweep 
 SEARCH_SWEEP_ANGLE = math.radians(45)  # rad each side (tune: 30°–90°)
-SEARCH_SWEEP_ANGLE_ALIGN = math.radians(180)  # rad each side (tune: 30°–90°)
+SEARCH_SWEEP_ANGLE_ALIGN = math.radians(90)  # rad each side (tune: 30°–90°)
 SEARCH_SEQUENCE    = [0.0, SEARCH_SWEEP_ANGLE, 0.0, -SEARCH_SWEEP_ANGLE, 0.0]
 SEARCH_SEQUENCE_ALIGN    = [0.0, SEARCH_SWEEP_ANGLE_ALIGN, 0.0, -SEARCH_SWEEP_ANGLE_ALIGN, 0.0]
 SEARCH_OMEGA       = 0.35    # rad/s angular speed during search rotation
@@ -234,8 +205,7 @@ SEARCH_FWD_VEL     = 0.10    # m/s during forward advance
 # ALIGN_DIST: drive base to stand-off point computed from marker pose 
 # Robot drives to a world-frame XY target (marker_pos + ALIGN_TARGET_DIST *
 # marker_normal). No angular correction during this phase.
-ALIGN_TARGET_DIST    = 0.8
-# m  stand-off from marker face (tune)
+ALIGN_TARGET_DIST    = 0.80   # m  stand-off from marker face (tune)
 ALIGN_DIST_NAV_TOL   = 0.08   # m  XY arrival tolerance
 ALIGN_DIST_K_HEAD    = 1.20   # rad/s per rad  heading-to-target P-gain
 ALIGN_DIST_K_FWD     = 0.40   # m/s  per m     forward speed P-gain
@@ -283,16 +253,39 @@ class State(Enum):
     # SUCTION_OFF_FINAL = auto()
 
 
-# Camera intrinsics — fallback used until camera_info is received.
-# Populated automatically from CAMERA_INFO_TOPIC in _camera_info_cb.
+# Camera intrinsics (from turtlebot_featherstone.scn) 
 _IMG_W, _IMG_H = 1920, 1080
 _HFOV_DEG      = 69.0
 _FX = _FY      = (_IMG_W / 2.0) / math.tan(math.radians(_HFOV_DEG / 2.0))
 _CX, _CY       = _IMG_W / 2.0, _IMG_H / 2.0
-_DEFAULT_CAMERA_MATRIX = np.array([[_FX, 0.0, _CX],
-                                    [0.0, _FY, _CY],
-                                    [0.0, 0.0, 1.0]], dtype=np.float64)
-_DEFAULT_DIST_COEFFS   = np.zeros(5, dtype=np.float64)
+CAMERA_MATRIX  = np.array([[_FX, 0.0, _CX],
+                             [0.0, _FY, _CY],
+                             [0.0, 0.0, 1.0]], dtype=np.float64)
+DIST_COEFFS    = np.zeros(5, dtype=np.float64)  # simulation: no distortion
+
+
+# Bézier helpers (was trying something, didn't delete it in case it's useful for future path-tracking improvements)
+# def _bezier(t: float, P0: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
+#     """Position on quadratic Bézier at parameter t ∈ [0, 1]."""
+#     return (1.0 - t)**2 * P0 + 2.0 * (1.0 - t) * t * P1 + t**2 * P2
+#
+# def _bezier_vel(t: float, P0: np.ndarray, P1: np.ndarray, P2: np.ndarray) -> np.ndarray:
+#     """Tangent (derivative w.r.t. t) of quadratic Bézier."""
+#     return 2.0 * (1.0 - t) * (P1 - P0) + 2.0 * t * (P2 - P1)
+#
+# def _bezier_cubic(t: float,
+#                   P0: np.ndarray, P1: np.ndarray,
+#                   P2: np.ndarray, P3: np.ndarray) -> np.ndarray:
+#     """Position on cubic Bézier at parameter t ∈ [0, 1]."""
+#     u = 1.0 - t
+#     return u**3*P0 + 3.0*u**2*t*P1 + 3.0*u*t**2*P2 + t**3*P3
+#
+# def _bezier_cubic_vel(t: float,
+#                       P0: np.ndarray, P1: np.ndarray,
+#                       P2: np.ndarray, P3: np.ndarray) -> np.ndarray:
+#     """Tangent (derivative w.r.t. t) of cubic Bézier."""
+#     u = 1.0 - t
+#     return 3.0*(u**2*(P1-P0) + 2.0*u*t*(P2-P1) + t**2*(P3-P2))
 
 
 class PickPlaceVMSNode(Node):
@@ -334,8 +327,6 @@ class PickPlaceVMSNode(Node):
         self._align_search_psi     = None    # heading reference for ALIGN_ANGLE sweep
         self._align_search_idx     = 0       # current step in sweep sequence
         self._align_search_hold    = None    # hold-start time at each sweep waypoint
-        self._align_step_target_psi = None   # target heading for current incremental step
-        self._new_camera_frame      = False  # True each time _camera_cb fires
 
         # approach cached targets 
         self._approach_target     = None  # standoff position above box
@@ -380,36 +371,25 @@ class PickPlaceVMSNode(Node):
             [-h, -h, 0.0],
         ], dtype=np.float64)
 
-        # camera intrinsics — updated from camera_info topic
-        self._camera_matrix = _DEFAULT_CAMERA_MATRIX.copy()
-        self._dist_coeffs   = _DEFAULT_DIST_COEFFS.copy()
-        self._camera_info_received = False
-
-        # camera visualisation
+        # camera visualisation 
         self._bridge        = CvBridge()
         self._vis_frame     = None   # latest annotated frame (updated in camera cb)
         cv2.namedWindow('ArUco Detection', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('ArUco Detection', 960, 540)
 
-        # ROS I/O
+        # ROS I/O 
         self._tf_buffer   = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self._sub_js       = self.create_subscription(
+        self._sub_js  = self.create_subscription(
             JointState, JOINT_STATE_TOPIC, self._js_cb, 10)
-        self._sub_djs      = self.create_subscription(
-            DynamicJointState, DYNAMIC_JOINT_STATE_TOPIC, self._dynamic_js_cb, 10)
-        self._sub_img      = self.create_subscription(
+        self._sub_img = self.create_subscription(
             Image, CAMERA_TOPIC, self._camera_cb, 5)
-        self._sub_cam_info = self.create_subscription(
-            CameraInfo, CAMERA_INFO_TOPIC, self._camera_info_cb, 1)
 
         self._pub_arm     = self.create_publisher(
             Float64MultiArray, JOINT_CMD_TOPIC, 10)
         self._pub_base    = self.create_publisher(Twist, BASE_CMD_TOPIC, 10)
         self._pub_markers = self.create_publisher(MarkerArray, MARKER_TOPIC, 10)
-        self._pub_pump    = self.create_publisher(
-            DynamicInterfaceGroupValues, PUMP_CMD_TOPIC, 10)
 
         self._suction_cli = self.create_client(SetBool, SUCTION_SRV)
 
@@ -419,49 +399,14 @@ class PickPlaceVMSNode(Node):
 
         self.get_logger().info('PickPlaceVMSNode started — State: SEARCH')
 
-    # Joint-state callback — simulation (Stonefish)
+    # Joint-state callback 
     def _js_cb(self, msg):
-        if USE_DYNAMIC_JOINT_STATES:
-            return
         pos_map = dict(zip(msg.name, msg.position))
         for i, jn in enumerate(JOINT_NAMES_4DOF):
             if jn in pos_map:
                 self._arm_q[i] = pos_map[jn]
 
-    # DynamicJointState callback — real robot (ros2_control)
-    def _dynamic_js_cb(self, msg: DynamicJointState):
-        if not USE_DYNAMIC_JOINT_STATES:
-            return
-        name_to_q = {
-            'swiftpro/joint1': 0,
-            'swiftpro/joint2': 1,
-            'swiftpro/joint3': 2,
-            'swiftpro/joint4': 3,
-        }
-        for i, jname in enumerate(msg.joint_names):
-            if jname not in name_to_q:
-                continue
-            iface = msg.interface_values[i]
-            iface_names = list(iface.interface_names)
-            if 'position' in iface_names:
-                pos_idx = iface_names.index('position')
-                self._arm_q[name_to_q[jname]] = float(iface.values[pos_idx])
-
-
-    # Camera-info callback — populate intrinsics once
-    def _camera_info_cb(self, msg: CameraInfo):
-        if self._camera_info_received:
-            return
-        K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-        D = np.array(msg.d, dtype=np.float64)
-        self._camera_matrix = K
-        self._dist_coeffs   = D
-        self._camera_info_received = True
-        self.get_logger().info(
-            f'Camera intrinsics loaded from {CAMERA_INFO_TOPIC}\n'
-            f'  K = {K}\n  D = {D}')
-
-    # Camera callback — ArUco detection + visualisation
+    # Camera callback — ArUco detection + visualisation 
     def _camera_cb(self, msg):
         try:
             frame = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -506,24 +451,12 @@ class PickPlaceVMSNode(Node):
                     ok, rvec, tvec = cv2.solvePnP(
                         self._marker_obj_pts,
                         mc.reshape(4, 2),
-                        self._camera_matrix,
-                        self._dist_coeffs,
+                        CAMERA_MATRIX,
+                        DIST_COEFFS,
                     )
                     # tvec = translation (3D position of marker centre in camera frame)
                     if ok:
-                        # Ensure marker Z-axis points TOWARD the camera.
-                        # Camera Z points into the scene, so the marker facing the
-                        # camera has mz_cam[2] < 0.  If solvePnP returns the
-                        # opposite solution (real-robot convention mismatch), rotate
-                        # 180° around the marker X-axis to flip Z and Y.
-                        R_pnp, _ = cv2.Rodrigues(rvec)
-                        mz_cam = R_pnp @ np.array([0.0, 0.0, 1.0])
-                        if mz_cam[2] > 0:
-                            R_flip = R_pnp @ np.array([[1, 0, 0],
-                                                        [0, -1, 0],
-                                                        [0, 0, -1]], dtype=float)
-                            rvec, _ = cv2.Rodrigues(R_flip)
-                        cv2.drawFrameAxes(annotated, self._camera_matrix, self._dist_coeffs,
+                        cv2.drawFrameAxes(annotated, CAMERA_MATRIX, DIST_COEFFS,
                                           rvec, tvec, ARUCO_MARKER_SIZE * 0.7)
                         dist_m = float(np.linalg.norm(tvec))
                         cv2.putText(annotated,
@@ -636,22 +569,14 @@ class PickPlaceVMSNode(Node):
                     (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
 
         self._vis_frame = annotated
-        self._new_camera_frame = True   # signal ALIGN_ANGLE a new frame is available
 
-    # Visualisation timer
+    # Visualisation timer 
     def _vis_tick(self):
         if self._vis_frame is not None:
             cv2.imshow('ArUco Detection', self._vis_frame)
         cv2.waitKey(1)
 
-    # Marker freshness check
-    def _marker_fresh(self) -> bool:
-        """True if the latest ArUco detection arrived within MARKER_FRESHNESS_S."""
-        if self._marker_detect_time is None:
-            return False
-        return (time.time() - self._marker_detect_time) < MARKER_FRESHNESS_S
-
-    # TF readiness check
+    # TF readiness check 
     def _tf_ready(self) -> bool:
         """Returns True once all required TF frames are available."""
         required = [
@@ -758,10 +683,7 @@ class PickPlaceVMSNode(Node):
 
         if self._path_start_t is not None:
             elapsed_s = (self.get_clock().now() - self._path_start_t).nanoseconds / 1e9
-            _period = (APPROACH_VMS_PATH_PERIOD
-                       if self._state == State.APPROACH_BOX_VMS
-                       else VMS_PATH_PERIOD)
-            alpha = float(np.clip(elapsed_s / _period, 0.0, 1.0))
+            alpha = float(np.clip(elapsed_s / VMS_PATH_PERIOD, 0.0, 1.0))
         else:
             alpha = float('nan')
 
@@ -782,12 +704,10 @@ class PickPlaceVMSNode(Node):
         )
         self.get_logger().info(log)
 
-    # FSM: SEARCH
+    # FSM: SEARCH 
     def _run_search(self):
-        # Only act on a fresh detection — stale data from a slow camera must not
-        # trigger a premature transition.
-        if self._marker_rvec is not None and self._marker_tvec is not None \
-                and self._marker_fresh():
+        # Check for marker on every tick — even during forward advance
+        if self._marker_rvec is not None and self._marker_tvec is not None:
             target = self._compute_align_target()
             if target is not None:
                 self._align_target_world = target
@@ -909,175 +829,95 @@ class PickPlaceVMSNode(Node):
             # This only runs once — on the very first tick after the state transition. 
             # _align_search_psi is reset to None in _transition(), so it's None only at entry. 
             # After this block sets it, subsequent ticks skip the flush entirely.
-            self._marker_rvec           = None
-            self._marker_tvec           = None
-            self._marker_detect_time    = None
-            self._align_search_psi      = self._base_psi
-            self._align_search_idx      = 0
-            self._align_step_target_psi = None
-            self._new_camera_frame      = False
+            self._marker_rvec        = None
+            self._marker_tvec        = None
+            self._marker_detect_time = None
+            self._align_search_psi   = self._base_psi   # latch entry heading
+            self._align_search_idx   = 0
             self.get_logger().info(
                 f'ALIGN_ANGLE entered, flushed stale PnP, '
                 f'psi={math.degrees(self._base_psi):.1f}°')
 
-        step_rad = math.radians(ALIGN_STEP_DEG)
-
-        # ── Phase 1: actively rotating to the computed target heading ─────────
-        # Sends velocity every tick.  If a new camera frame arrives mid-rotation,
-        # the step target is updated immediately — adaptive correction in real time.
-        # Threshold: when |center_angle| < ALIGN_STEP_DEG the step equals the
-        # exact error (np.clip is inactive), so oscillation stops naturally.
-        if self._align_step_target_psi is not None:
-
-            # If a new frame arrived during rotation, update the target adaptively
-            if self._new_camera_frame and self._marker_rvec is not None \
-                    and self._marker_fresh():
-                self._new_camera_frame = False
-                tv_r         = self._marker_tvec.flatten()
-                center_angle = math.atan2(float(tv_r[0]), float(tv_r[2]))
-                if abs(center_angle) < ALIGN_ANGLE_TOL:
-                    self.get_logger().info('Centred mid-rotation → APPROACH_BOX_VMS')
-                    self._send_base(0.0, 0.0)
-                    self._align_step_target_psi = None
-                    self._transition(State.APPROACH_BOX_VMS)
-                    return
-                new_step = float(np.clip(-center_angle, -step_rad, step_rad))
-                self._align_step_target_psi = _angle_wrap(self._base_psi + new_step)
-                self.get_logger().info(
-                    f'ALIGN_ANGLE [MID-ROTATION UPDATE] ctr={math.degrees(center_angle):+.1f}°'
-                    f' → new step {math.degrees(new_step):+.1f}°'
-                    f' → target={math.degrees(self._align_step_target_psi):.1f}°')
-
-            psi_err = _angle_wrap(self._align_step_target_psi - self._base_psi)
-            if abs(psi_err) > 0.02:
-                omega = float(np.clip(
-                    SEARCH_OMEGA * np.sign(psi_err), -ALIGN_MAX_OMEGA, ALIGN_MAX_OMEGA))
-                self._send_base(0.0, omega)
-                self.get_logger().info(
-                    f'ALIGN_ANGLE [ROTATING] psi_err={math.degrees(psi_err):+.1f}°'
-                    f'  omega={math.degrees(omega):+.1f}°/s',
-                    throttle_duration_sec=0.2)
-            else:
-                self._send_base(0.0, 0.0)
-                self._align_step_target_psi = None
-                self._new_camera_frame      = False  # discard any frame at exactly the stop point
-                self.get_logger().info('ALIGN_ANGLE [STEP DONE] — stopped, waiting for frame')
-            self._send_arm(np.zeros(4))
-            return
-
-        # ── Phase 2: step done, waiting for a new camera frame ───────────────
-        # Robot is stopped.  Nothing happens until _camera_cb fires.
-        if not self._new_camera_frame:
-            self._send_base(0.0, 0.0)
-            self._send_arm(np.zeros(4))
-            self.get_logger().info(
-                'ALIGN_ANGLE [WAITING] — no new camera frame yet',
-                throttle_duration_sec=1.0)
-            return
-
-        # ── Phase 3: new frame received — decide the next step ───────────────
-        self._new_camera_frame = False   # consume the flag
-
-        if self._marker_rvec is not None and self._marker_fresh():
-            tv           = self._marker_tvec.flatten()
-            center_angle = math.atan2(float(tv[0]), float(tv[2]))
+        if self._marker_rvec is not None:
+            # Aruco Marker visible — align 
+            tv = self._marker_tvec.flatten()
             R, _         = cv2.Rodrigues(self._marker_rvec)
             mz           = R @ np.array([0.0, 0.0, 1.0])
-            face_angle   = math.atan2(float(mz[0]), -float(mz[2]))
+            center_angle = math.atan2(float(tv[0]), float(tv[2]))
+            face_angle   = math.atan2(float(mz[0]), -float(mz[2]))  # logged only
 
             self.get_logger().info(
-                f'ALIGN_ANGLE [NEW FRAME] ctr={math.degrees(center_angle):+.1f}°  '
-                f'face={math.degrees(face_angle):+.1f}°  '
-                f'tol={math.degrees(ALIGN_ANGLE_TOL):.1f}°')
+                f'ALIGN_ANGLE: ctr={math.degrees(center_angle):+.1f}° '
+                f'face={math.degrees(face_angle):+.1f}° '
+                f'tol={math.degrees(ALIGN_ANGLE_TOL):.1f}°',
+                throttle_duration_sec=0.5)
 
             if abs(center_angle) < ALIGN_ANGLE_TOL:
-                self.get_logger().info('Centred → APPROACH_BOX_VMS')
+                self.get_logger().info(
+                    f'Centered (ctr={math.degrees(center_angle):+.1f}° '
+                    f'face={math.degrees(face_angle):+.1f}°) -> APPROACH_BOX_VMS')
                 self._send_base(0.0, 0.0)
                 self._transition(State.APPROACH_BOX_VMS)
                 return
 
-            # Adaptive step: far → ALIGN_STEP_DEG; close → exact error (clip handles it)
-            step = float(np.clip(-center_angle, -step_rad, step_rad))
-            self._align_step_target_psi = _angle_wrap(self._base_psi + step)
+            # Drive omega from center_angle only — face_angle excluded because
+            # at the stand-off point the two terms have opposite signs and cancel.
+            omega = float(np.clip(
+                -ALIGN_K_CENTER * center_angle,
+                -ALIGN_MAX_OMEGA, ALIGN_MAX_OMEGA))
+            self._send_base(0.0, omega)
+            self._send_arm(np.zeros(4))
+            # Reset sweep state so a loss-and-reacquire starts a fresh sweep
             self._align_search_idx  = 0
             self._align_search_hold = None
-            self.get_logger().info(
-                f'ALIGN_ANGLE [PLAN STEP] {math.degrees(step):+.1f}° '
-                f'→ target={math.degrees(self._align_step_target_psi):.1f}°')
-
         else:
-            # No detection — rotate fully to the next sweep waypoint (no ALIGN_STEP_DEG cap).
-            # Phase 1 will still respond to mid-rotation detections and switch to correction.
-            sweep_target = (self._align_search_psi
-                            + SEARCH_SEQUENCE_ALIGN[
-                                self._align_search_idx % len(SEARCH_SEQUENCE_ALIGN)])
-            psi_err = _angle_wrap(sweep_target - self._base_psi)
+            # Aruco Marker not visible — sweep ±SEARCH_SWEEP_ANGLE to find it
+            target_psi = (self._align_search_psi
+                          + SEARCH_SEQUENCE_ALIGN[self._align_search_idx % len(SEARCH_SEQUENCE_ALIGN)])
+            psi_err    = _angle_wrap(target_psi - self._base_psi)
+
             if abs(psi_err) < 0.05:
-                self._align_search_idx += 1
-                self.get_logger().info(
-                    f'ALIGN_ANGLE [SWEEP WAYPOINT REACHED] → next idx={self._align_search_idx}')
+                if self._align_search_hold is None:
+                    self._align_search_hold = time.time()
+                self._send_base(0.0, 0.0)
+                if time.time() - self._align_search_hold >= SEARCH_HOLD_S:
+                    self._align_search_idx  += 1
+                    self._align_search_hold  = None
             else:
-                # Go straight to the full waypoint — no step clip
-                self._align_step_target_psi = sweep_target
-                self.get_logger().info(
-                    f'ALIGN_ANGLE [SWEEP] rotating {math.degrees(psi_err):+.1f}° '
-                    f'to waypoint {math.degrees(sweep_target):.1f}°')
+                omega = float(np.clip(SEARCH_OMEGA * np.sign(psi_err),
+                                      -SEARCH_OMEGA, SEARCH_OMEGA))
+                self._align_search_hold = None
+                self._send_base(0.0, omega)
 
             self._send_arm(np.zeros(4))
 
-    # FSM: APPROACH_BOX_VMS
+    # FSM: APPROACH_BOX_VMS 
     def _run_approach_box_vms(self):
         """
-        Weighted VMS: drive EE above the box for APPROACH_VMS_PATH_PERIOD seconds.
-
-        _approach_target is refreshed every tick from the latest camera
-        detection so the target tracks the box as the robot approaches.
-        _box_locked remains False throughout; it is set to True only when
-        the state transitions to PICK_DESCEND so subsequent states use the
-        last observed box position.
-
-        Transition trigger: elapsed time >= APPROACH_VMS_PATH_PERIOD (not
-        position tolerance), ensuring the full approach window is used even
-        if the EE converges early.
+        Single-target weighted VMS: drive EE directly above the box at
+        approach height.  Base DOFs are very expensive so the arm handles
+        almost all the motion; the base only nudges if the arm truly cannot
+        reach alone.  Tune W_BASE_COST to control how much the base moves.
         """
-        # Update approach target from latest camera detection every tick
-        if self._box_top_world is not None and self._marker_fresh():
+        if self._approach_target is None:
             bx, by, bz = self._box_top_world
             fwd = np.array([math.cos(self._base_psi),
                             math.sin(self._base_psi), 0.0])
-            new_target = (np.array([bx, by, bz + APPROACH_HEIGHT_ABOVE])
-                          + EE_TOUCH_FORWARD_OFFSET * fwd)
-            if self._approach_target is None:
-                self._approach_target = new_target
-                self.get_logger().info(
-                    f'Approach target init (psi={math.degrees(self._base_psi):.1f}°): '
-                    f'{np.round(new_target, 3)}')
-            elif float(np.linalg.norm(new_target - self._approach_target)) > 0.005:
-                self._approach_target = new_target
-
-        if self._approach_target is None:
+            fwd_offset = EE_TOUCH_FORWARD_OFFSET * fwd
+            self._approach_target = np.array([bx, by, bz + APPROACH_HEIGHT_ABOVE]) + fwd_offset
+            self._box_locked = True
             self.get_logger().info(
-                'APPROACH_BOX_VMS: waiting for detection…',
-                throttle_duration_sec=1.0)
-            self._send_base(0.0, 0.0)
-            self._send_arm(np.zeros(4))
-            return
+                f'Approach target (above box, psi={math.degrees(self._base_psi):.1f}°): '
+                f'{np.round(self._approach_target, 3)}')
 
         W = np.diag([W_BASE_COST, W_BASE_COST,
                      W_ARM_COST,  W_ARM_COST,
                      W_ARM_COST,  W_ARM_COST])
-        self._vms_nav_step(self._approach_target, weight_matrix=W,
-                           path_period=APPROACH_VMS_PATH_PERIOD)
+        self._vms_nav_step(self._approach_target, weight_matrix=W)
 
-        # Transition after path period expires — lock box position here
-        if self._path_start_t is not None:
-            elapsed = (self.get_clock().now() - self._path_start_t).nanoseconds / 1e9
-            if elapsed >= APPROACH_VMS_PATH_PERIOD:
-                self.get_logger().info(
-                    f'Approach period ({APPROACH_VMS_PATH_PERIOD:.0f}s) complete '
-                    f'-> PICK_DESCEND  target={np.round(self._approach_target, 3)}')
-                self._box_locked = True
-                self._transition(State.PICK_DESCEND)
+        if self._at_position(self._approach_target, EE_REACH_TOL):
+            self.get_logger().info('Approach reached -> PICK_DESCEND')
+            self._transition(State.PICK_DESCEND)
 
     # FSM: PICK_DESCEND 
     def _run_pick_descend(self):
@@ -1268,9 +1108,8 @@ class PickPlaceVMSNode(Node):
 
         return zeta
 
-    # VMS nav step — straight-line path (optional weighted DLS)
-    def _vms_nav_step(self, target_world: np.ndarray, weight_matrix=None,
-                      path_period: float = None):
+    # VMS nav step — straight-line path (optional weighted DLS) 
+    def _vms_nav_step(self, target_world: np.ndarray, weight_matrix=None):
         """
         Drive EE toward target_world using full VMS with a straight-line
         interpolated path and feedforward velocity.
@@ -1279,13 +1118,7 @@ class PickPlaceVMSNode(Node):
             If provided, the position task uses weighted_DLS(W) so that
             expensive DOFs (e.g. base) are avoided in favour of cheap ones
             (e.g. arm joints).  None -> standard DLS for all tasks.
-        path_period : override for the sliding-waypoint period (s).
-            Defaults to VMS_PATH_PERIOD.  APPROACH_BOX_VMS passes
-            APPROACH_VMS_PATH_PERIOD (60 s) so the approach lasts longer.
         """
-        if path_period is None:
-            path_period = VMS_PATH_PERIOD
-
         ee = self._last_tf_ee
 
         if self._path_start is None:
@@ -1294,11 +1127,11 @@ class PickPlaceVMSNode(Node):
             self._path_start_t = self.get_clock().now()
 
         elapsed      = (self.get_clock().now() - self._path_start_t).nanoseconds / 1e9
-        alpha        = float(np.clip(elapsed / path_period, 0.0, 1.0))
+        alpha        = float(np.clip(elapsed / VMS_PATH_PERIOD, 0.0, 1.0))
         path_desired = self._path_start + alpha * (target_world - self._path_start)
         self._path_desired = path_desired
 
-        ff_vel = ((target_world - self._path_start) / path_period
+        ff_vel = ((target_world - self._path_start) / VMS_PATH_PERIOD
                   if alpha < 1.0 else np.zeros(3))
 
         self._pos_task.setDesired(path_desired.reshape(3, 1))
@@ -1339,24 +1172,12 @@ class PickPlaceVMSNode(Node):
         self._pub_arm.publish(msg)
 
     def _call_suction(self, enable: bool):
-        state_str = 'ON' if enable else 'OFF'
-        if USE_REAL_PUMP:
-            msg = DynamicInterfaceGroupValues()
-            iv = InterfaceValue()
-            iv.interface_names = ['pump']
-            iv.values = [1.0 if enable else 0.0]
-            msg.interface_groups = ['swiftpro/pump']
-            msg.interface_values = [iv]
-            self._pub_pump.publish(msg)
-            self.get_logger().info(f'Pump {state_str} — published to {PUMP_CMD_TOPIC}')
-        else:
-            if not self._suction_cli.wait_for_service(timeout_sec=0.5):
-                self.get_logger().warn('Suction service not available', throttle_duration_sec=2.0)
-                return
-            req = SetBool.Request()
-            req.data = enable
-            self._suction_cli.call_async(req)
-            self.get_logger().info(f'Pump {state_str} — called service {SUCTION_SRV}')
+        if not self._suction_cli.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn('Suction service not available', throttle_duration_sec=2.0)
+            return
+        req = SetBool.Request()
+        req.data = enable
+        self._suction_cli.call_async(req)
 
     def _transition(self, new_state: State):
         self.get_logger().info(f'{self._state.name} -> {new_state.name}')
@@ -1380,29 +1201,13 @@ class PickPlaceVMSNode(Node):
 
     def _update_vms_state(self):
         """Refresh all TF-based state fields and VMSRobotState."""
-        # Always update J1 position from TF (FK still needs it as the base point)
+        ee = self._tf_pos(EE_FRAME)
+        if ee is not None:
+            self._last_tf_ee = ee
+
         j1 = self._tf_pos(J1_FRAME)
         if j1 is not None:
             self._link1_world = j1
-
-        if USE_TF_FOR_EE:
-            # Try TF lookup of end_effector frame; fall back to FK if it fails.
-            ee = self._tf_pos(EE_FRAME)
-            if ee is not None:
-                self._last_tf_ee = ee
-            else:
-                fk_ee = swiftpro_fk_vms_5dof(
-                    self._link1_world, self._arm_q, self._base_psi, self._tf_buffer)
-                if fk_ee is not None:
-                    self._last_tf_ee = fk_ee
-        else:
-            # FK only — no TF lookup for EE (USE_TF_FOR_EE = False).
-            fk_ee = swiftpro_fk_vms_5dof(
-                self._link1_world, self._arm_q, self._base_psi, self._tf_buffer)
-            if fk_ee is not None:
-                self._last_tf_ee = fk_ee
-                self.get_logger().info(
-                    f'EE [FK]: {np.round(fk_ee, 3)}', throttle_duration_sec=2.0)
 
         pose = self._tf_pose(BASE_FRAME)
         if pose is not None:
@@ -1675,27 +1480,19 @@ class PickPlaceVMSNode(Node):
 
     def _compute_align_target(self):
         """
-        Compute world-frame XY stand-off point directly in front of the marker.
-
-        Uses the camera-to-marker direction (from tvec) rather than the
-        rvec-derived marker Z axis.  rvec is noisy on real cameras (planar
-        marker ambiguity) and can produce a vector that points sideways or
-        behind the marker.  The tvec direction is always stable: it points
-        from the camera origin to the marker centre, so -tvec/|tvec| always
-        points from the marker toward the camera — exactly where the stand-off
-        target should be.
-
+        Compute world-frame XY stand-off point directly in front of the marker face.
+        Point = marker_world_pos + ALIGN_TARGET_DIST * marker_Z_in_world
+        (marker Z points toward the camera, so we follow it back from the marker).
         Returns np.array([x, y]) or None on TF failure.
         """
-        if self._marker_tvec is None:
+        if self._marker_rvec is None or self._marker_tvec is None:
             return None
-        tv   = self._marker_tvec.flatten()
-        dist = float(np.linalg.norm(tv))
-        if dist < 0.05:
-            return None
-        toward_cam   = -tv / dist          # unit vector: marker → camera (camera frame)
-        standoff_cam = tv + ALIGN_TARGET_DIST * toward_cam
-        world = self._camera_to_world(standoff_cam, 0.0)
+        R, _    = cv2.Rodrigues(self._marker_rvec)
+        mz_cam  = R @ np.array([0.0, 0.0, 1.0])   # marker Z in camera frame
+        # Stand-off point in camera frame: move along marker Z (toward camera)
+        tv      = self._marker_tvec.flatten()
+        standoff_cam = tv + ALIGN_TARGET_DIST * mz_cam
+        world   = self._camera_to_world(standoff_cam, 0.0)
         if world is None:
             return None
         return world[:2]   # only XY — base navigates on the ground plane

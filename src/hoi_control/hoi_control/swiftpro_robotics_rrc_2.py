@@ -1,30 +1,13 @@
 import math
 import numpy as np
 
+
+
 from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import Point, Vector3Stamped, TransformStamped
 import rclpy
 TF_AVAILABLE = True
 from tf_transformations import quaternion_matrix
-
-# ── NED→ENU frame conversion flag ────────────────────────────────────────────
-# Set True  → always use the analytic R matrix below (no TF lookup).
-#             Required on the real robot: the world_ned→world_enu TF lookup
-#             introduces lag / jitter that makes FK and Jacobian outputs noisy,
-#             which in turn causes base oscillation even when the robot is
-#             commanded to hold still.
-# Set False → attempt the TF lookup first; fall back to R matrix on failure.
-#             Leave False for simulation where the TF tree is clean.
-USE_ANALYTIC_NED_TO_ENU = False   # ← set False for simulation, True for real robot
-
-# Standard 180° rotation around X: maps NED→ENU.
-#   x_enu =  x_ned,   y_enu = -y_ned,   z_enu = -z_ned
-# Equivalent to the static world_ned → world_enu transform in the real URDF.
-R_NED_TO_ENU = np.array([
-    [1.0,  0.0,  0.0],
-    [0.0, -1.0,  0.0],
-    [0.0,  0.0, -1.0],
-], dtype=float)
 # uArm Swift Pro – geometric link parameters (metres)
 # These constants were derived by tracing the URDF joint chain geometrically
 # (no DH convention — invalid for closed-chain parallelogram linkages).
@@ -66,13 +49,13 @@ Q4_MAX =  1.571   # joint4 EE yaw     upper (+π/2)
 
 # Joint index mapping in /joint_states
 JOINT_NAMES = [
-    'swiftpro/joint1',   # index 0 – base yaw   (q1)
-    'swiftpro/joint2',   # index 1 – shoulder   (q2)
-    'swiftpro/joint3',   # index 2 – elbow      (q3)
+    'turtlebot/swiftpro/joint1',   # index 0 – base yaw   (q1)
+    'turtlebot/swiftpro/joint2',   # index 1 – shoulder   (q2)
+    'turtlebot/swiftpro/joint3',   # index 2 – elbow      (q3)
 ]
 
 # 4-DOF name list — same order as the q vector [q1, q2, q3, q4]
-JOINT_NAMES_4DOF = JOINT_NAMES + ['swiftpro/joint4']
+JOINT_NAMES_4DOF = JOINT_NAMES + ['turtlebot/swiftpro/joint4']
 
 
 # Forward Kinematics with TF Buffer Transform
@@ -123,27 +106,48 @@ def swiftpro_fk_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', t
     pos_ned = np.array([x_ned, y_ned, z_ned])
     
 
-    # When the analytic flag is set, skip TF lookup entirely.
-    if USE_ANALYTIC_NED_TO_ENU:
-        return R_NED_TO_ENU @ pos_ned
-
     if tf_buffer is not None and TF_AVAILABLE:
         try:
+            
             transform = tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
+                target_frame, 
+                source_frame, 
                 rclpy.time.Time()
             )
+            
+            # Extract rotation matrix from the quaternion in the transform
+
             quat = transform.transform.rotation
             q_array = [quat.x, quat.y, quat.z, quat.w]
             transform_matrix = quaternion_matrix(q_array)
             rotation_matrix = transform_matrix[:3, :3]
-            return rotation_matrix @ pos_ned
+            
+            # Apply the rotation to convert from NED to ENU
+            pos_transformed = rotation_matrix @ pos_ned
+            
+            return pos_transformed
+            
         except Exception as e:
-            print(f"TF lookup failed: {e}. Using analytic NED→ENU rotation.")
-            return R_NED_TO_ENU @ pos_ned
+            # If lookup fails, fall back to manual rotation
+            print(f"TF lookup failed: {e}. Using manual rotation.")
+            # Apply manual 180° rotation around x-axis
+            rotation_matrix = np.array([
+                [1.0,  0.0,   0.0],
+                [0.0, -1.0,   0.0],
+                [0.0,  0.0,  -1.0],
+            ])
+            pos_transformed = rotation_matrix @ pos_ned
+            return pos_transformed
     else:
-        return R_NED_TO_ENU @ pos_ned
+        # Fallback: apply manual rotation matrix (180° around x-axis)
+        # NED to ENU: [1, 0, 0; 0, -1, 0; 0, 0, -1]
+        rotation_matrix = np.array([
+            [1.0,  0.0,   0.0],
+            [0.0, -1.0,   0.0],
+            [0.0,  0.0,  -1.0],
+        ])
+        pos_transformed = rotation_matrix @ pos_ned
+        return pos_transformed
 
 # ---------------------------------------------------------------------------
 # Geometric Forward Kinematics
@@ -215,29 +219,41 @@ def swiftpro_jacobian_with_tf_transform(q, tf_buffer=None, source_frame='world_n
         [  0.0,             -dz_ee_dq2,             -dz_ee_dq3         ],
     ])
 
-    # When the analytic flag is set, skip TF lookup entirely.
-    # J_target = R @ J_ned  (same R as FK — velocity transforms identically).
-    if USE_ANALYTIC_NED_TO_ENU:
-        return R_NED_TO_ENU @ J_ned
-
+    # Transform Jacobian from NED to target frame
     if tf_buffer is not None and TF_AVAILABLE:
         try:
             transform = tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
+                target_frame, 
+                source_frame, 
                 rclpy.time.Time()
             )
+            
+            # Extract rotation matrix from the quaternion
             quat = transform.transform.rotation
             q_array = [quat.x, quat.y, quat.z, quat.w]
             transform_matrix = quaternion_matrix(q_array)
             rotation_matrix = transform_matrix[:3, :3]
+            
         except Exception as e:
-            print(f"TF lookup failed: {e}. Using analytic NED→ENU rotation for Jacobian.")
-            rotation_matrix = R_NED_TO_ENU
+            # If lookup fails, use fallback rotation
+            print(f"TF lookup failed: {e}. Using fallback rotation for Jacobian.")
+            rotation_matrix = np.array([
+                [1.0,  0.0,   0.0],
+                [0.0, -1.0,   0.0],
+                [0.0,  0.0,  -1.0],
+            ])
     else:
-        rotation_matrix = R_NED_TO_ENU
+        # Fallback: NED to ENU rotation (180° around x-axis)
+        rotation_matrix = np.array([
+            [1.0,  0.0,   0.0],
+            [0.0, -1.0,   0.0],
+            [0.0,  0.0,  -1.0],
+        ])
 
-    return rotation_matrix @ J_ned
+    # Apply rotation: J_target = R @ J_ned
+    J_target = rotation_matrix @ J_ned
+
+    return J_target
 
 
 def swiftpro_jacobian_pos4_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', target_frame='world_enu'):
@@ -638,8 +654,8 @@ class VMSRobotState:
         return self.ee_world.copy()
 
     def getEEYaw(self):
-        return self.base_psi + self.arm_q[0] + self.arm_q[3]
-        # return self.arm_q[3]
+        # return self.base_psi + self.arm_q[0] + self.arm_q[3]
+        return self.arm_q[3]
 
     def getEEJacobian(self):
         """3×6 position Jacobian — top 3 rows of the full 4×6 Jacobian."""
@@ -982,7 +998,7 @@ class ArmJointPositionTask(Task):
 # ---------------------------------------------------------------------------
 #  Recursive Task-Priority solver for VMS
 
-def vms_task_priority_step(tasks, state, damping=0.1, method=2, weight_matrix=None):
+def vms_task_priority_step(tasks, state, damping=0.1, method=2):
     """
     One step of the recursive Task-Priority algorithm for the VMS.
 
@@ -992,17 +1008,13 @@ def vms_task_priority_step(tasks, state, damping=0.1, method=2, weight_matrix=No
 
     Arguments
     ---------
-    tasks          : list[Task]          — ordered highest → lowest priority
-    state          : VMSRobotState       — current robot state (call update() first)
-    damping        : float               — DLS λ (only used when method=2)
-    method         : int                 — inverse method for velocity update:
-                                             0 = Jacobian transpose  (J^T, no inversion)
-                                             1 = Moore-Penrose pseudo-inverse  (np.linalg.pinv)
-                                             2 = Damped Least-Squares (default, stable near singularities)
-    weight_matrix  : np.ndarray or None  — optional 6×6 positive-definite diagonal weight matrix.
-                                           When provided, uses weighted_DLS(W) instead of DLS.
-                                           Higher W_ii → DOF i more expensive → optimizer avoids it.
-                                           Only applied when method=2.
+    tasks   : list[Task]       — ordered highest → lowest priority
+    state   : VMSRobotState    — current robot state (call update() first)
+    damping : float            — DLS λ (only used when method=2)
+    method  : int              — inverse method for velocity update:
+                                   0 = Jacobian transpose  (J^T, no inversion)
+                                   1 = Moore-Penrose pseudo-inverse  (np.linalg.pinv)
+                                   2 = Damped Least-Squares (default, stable near singularities)
 
     Returns
     -------
@@ -1029,13 +1041,11 @@ def vms_task_priority_step(tasks, state, damping=0.1, method=2, weight_matrix=No
 
         # Compute the velocity-update inverse according to the chosen method.
         if method == 0:
-            Ji_bar_inv = Ji_bar.T                              # Jacobian transpose
+            Ji_bar_inv = Ji_bar.T                    # Jacobian transpose
         elif method == 1:
-            Ji_bar_inv = np.linalg.pinv(Ji_bar)               # Moore-Penrose pseudo-inverse
-        elif weight_matrix is not None:
-            Ji_bar_inv = weighted_DLS(Ji_bar, damping, weight_matrix)  # Weighted DLS
+            Ji_bar_inv = np.linalg.pinv(Ji_bar)      # Moore-Penrose pseudo-inverse
         else:
-            Ji_bar_inv = DLS(Ji_bar, damping)                  # Damped Least-Squares (default)
+            Ji_bar_inv = DLS(Ji_bar, damping)        # Damped Least-Squares (default)
 
         zeta = zeta + Ji_bar_inv @ (xi_dot - Ji @ zeta)
 
